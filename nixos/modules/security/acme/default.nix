@@ -862,15 +862,16 @@ in {
           }
         '';
       };
+
       maxConcurrentRenewals = lib.mkOption {
         default = 5;
-        type = lib.types.int;
+        type = lib.types.ints.unsigned;
         description = ''
-          Maximum number of concurrent certificate generation or renewal jobs. All other
-          jobs will queue and wait running jobs to finish. Reduces the system load of
-          certificate generation.
+          Maximum number of concurrent certificate generation and renewal jobs (combined total).
+          Any jobs started above that limit will wait until a spot becomes available.
+          This reduces the system load of certificate generation.
 
-          Set to `0` to allow unlimited number of concurrent job runs."
+          Set to `0` to allow unlimited number of concurrent job runs.
           '';
       };
     };
