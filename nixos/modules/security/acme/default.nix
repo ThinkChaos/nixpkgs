@@ -1,9 +1,8 @@
-{ config, lib, pkgs, options, ... }:
+{ config, lib, pkgs, ... }:
 let
 
 
   cfg = config.security.acme;
-  opt = options.security.acme;
   user = if cfg.useRoot then "root" else "acme";
 
   # Used to calculate timer accuracy for coalescing
@@ -189,7 +188,6 @@ let
     acmeServer = data.server;
     useDns = data.dnsProvider != null;
     useDnsOrS3 = useDns || data.s3Bucket != null;
-    destPath = "/var/lib/acme/${cert}";
     selfsignedDeps = lib.optionals (cfg.preliminarySelfsigned) [ "acme-selfsigned-${cert}.service" ];
 
     # Minica and lego have a "feature" which replaces * with _. We need
@@ -207,7 +205,7 @@ let
 
     # Create hashes for cert data directories based on configuration
     # Flags are separated to avoid collisions
-    hashData = with builtins; ''
+    hashData = ''
       ${lib.concatStringsSep " " data.extraLegoFlags} -
       ${lib.concatStringsSep " " data.extraLegoRunFlags} -
       ${lib.concatStringsSep " " data.extraLegoRenewFlags} -
