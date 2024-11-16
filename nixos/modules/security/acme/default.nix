@@ -15,34 +15,45 @@ let
   mkAccountHash = acmeServer: data: mkHash "${toString acmeServer} ${data.keyType} ${data.email}";
   accountDirRoot = "/var/lib/acme/.lego/accounts/";
 
-  lockdir = "/run/acme/";
-  concurrencyLockfiles = map (n: "${toString n}.lock") (lib.range 1 cfg.maxConcurrentRenewals);
-  # Assign elements of `baseList` to each element of `needAssignmentList`, until the latter is exhausted.
-  # returns: [{fst = "element of baseList"; snd = "element of needAssignmentList"}]
-  roundRobinAssign = baseList: needAssignmentList:
-    if baseList == [] then []
-    else _rrCycler baseList baseList needAssignmentList;
-  _rrCycler = with builtins; origBaseList: workingBaseList: needAssignmentList:
-    if (workingBaseList == [] || needAssignmentList == [])
-    then []
-    else
-      [{ fst = head workingBaseList; snd = head needAssignmentList;}] ++
-      _rrCycler origBaseList (if (tail workingBaseList == []) then origBaseList else tail workingBaseList) (tail needAssignmentList);
-  attrsToList = lib.mapAttrsToList (attrname: attrval: {name = attrname; value = attrval;});
-  # for an AttrSet `funcsAttrs` having functions as values, apply single arguments from
-  # `argsList` to them in a round-robin manner.
-  # Returns an attribute set with the applied functions as values.
-  roundRobinApplyAttrs = funcsAttrs: argsList: lib.listToAttrs (map (x: {inherit (x.snd) name; value = x.snd.value x.fst;}) (roundRobinAssign argsList (attrsToList funcsAttrs)));
-  wrapInFlock = lockfilePath: script:
-    # explainer: https://stackoverflow.com/a/60896531
-    ''
-      exec {LOCKFD}> ${lockfilePath}
-      echo "Waiting to acquire lock ${lockfilePath}"
-      ${pkgs.flock}/bin/flock ''${LOCKFD} || exit 1
-      echo "Acquired lock ${lockfilePath}"
-    ''
-    + script + "\n"
-    + ''echo "Releasing lock ${lockfilePath}"  # only released after process exit'';
+  writeMaxConcurrentShellScript = name: text:
+    let script = pkgs.writeShellScript name text; in
+    if cfg.maxConcurrentRenewals == 0
+    then script
+    else "exec ${lib.escapeShellArg lockAndRun} ${lib.escapeShellArg script}";
+
+  lockdir = "/run/acme";
+  lockAndRun = pkgs.writeShellScript "acme-lock-and-run.sh" ''
+    ${lib.optionalString cfg.defaults.enableDebugLogs "set -x"}
+    set -euo pipefail
+
+    echo >&2 'Waiting to acquire lock'
+
+    # Successively try each lock until we acquire one
+    i="$RANDOM"  # Reduce contention/average wait
+    while true; do
+      lock=${lib.escapeShellArg lockdir}/"$((i = (i + 1) % ${toString cfg.maxConcurrentRenewals})).lock"
+
+      exec {lockFD}> "$lock"  # Create/truncate and open lock as lockFD
+
+      ecode=0
+      ${lib.getExe pkgs.flock} --timeout 1 --conflict-exit-code 254 "$lockFD" || ecode=$?
+      case "$ecode" in
+      254)  # Lock already in use
+        exec {lockFD}<&-  # Close the fd
+        ;;
+
+      0)
+        echo >&2 "Acquired $lock"
+        exec "$@"  # Lock is held until process exits
+        ;;
+
+      *)
+        echo >&2 "Unexpected error trying to acquire $lock"
+        exit $ecode
+        ;;
+      esac
+    done
+  '';
 
 
   # There are many services required to make cert renewals work.
@@ -277,7 +288,7 @@ let
       };
     };
 
-    selfsignService = lockfileName: {
+    selfsignService = {
       description = "Generate self-signed certificate for ${cert}";
       after = [ "acme-setup.service" ];
       requires = [ "acme-setup.service" ];
@@ -304,7 +315,10 @@ let
       # Working directory will be /tmp
       # minica will output to a folder sharing the name of the first domain
       # in the list, which will be ${data.domain}
-      script = (if (lockfileName == null) then lib.id else wrapInFlock "${lockdir}${lockfileName}") ''
+      script = writeMaxConcurrentShellScript "acme-selfsigned-${cert}" ''
+        ${lib.optionalString cfg.defaults.enableDebugLogs "set -x"}
+        set -euo pipefail
+
         minica \
           --ca-key ca/key.pem \
           --ca-cert ca/cert.pem \
@@ -325,7 +339,7 @@ let
       '';
     };
 
-    renewService = lockfileName: {
+    renewService = {
       description = "Renew ACME certificate for ${cert}";
       after = [ "network.target" "network-online.target" "acme-setup.service" "nss-lookup.target" ] ++ selfsignedDeps;
       wants = [ "network-online.target" ] ++ selfsignedDeps;
@@ -387,7 +401,7 @@ let
       };
 
       # Working directory will be /tmp
-      script = (if (lockfileName == null) then lib.id else wrapInFlock "${lockdir}${lockfileName}") ''
+      script = writeMaxConcurrentShellScript "acme-${cert}" ''
         ${lib.optionalString data.enableDebugLogs "set -x"}
         set -euo pipefail
 
@@ -480,6 +494,8 @@ let
         # By default group will have no access to the cert files.
         # This chmod will fix that.
         chmod 640 out/*
+
+        echo 'ACME certificate is ready'
       '';
     };
   };
@@ -969,19 +985,12 @@ in {
 
       users.groups.acme = {};
 
-      systemd.services = let
-        renewServiceFunctions = lib.mapAttrs' (cert: conf: lib.nameValuePair "acme-${cert}" conf.renewService) certConfigs;
-        renewServices =  if cfg.maxConcurrentRenewals > 0
-          then roundRobinApplyAttrs renewServiceFunctions concurrencyLockfiles
-          else lib.mapAttrs (_: f: f null) renewServiceFunctions;
-        selfsignServiceFunctions = lib.mapAttrs' (cert: conf: lib.nameValuePair "acme-selfsigned-${cert}" conf.selfsignService) certConfigs;
-        selfsignServices = if cfg.maxConcurrentRenewals > 0
-          then roundRobinApplyAttrs selfsignServiceFunctions concurrencyLockfiles
-          else lib.mapAttrs (_: f: f null) selfsignServiceFunctions;
-        in
+      systemd.services =
         { acme-setup = setupService; }
-        // renewServices
-        // (lib.optionalAttrs cfg.preliminarySelfsigned selfsignServices);
+        // lib.mapAttrs' (cert: conf: lib.nameValuePair "acme-${cert}" conf.renewService) certConfigs
+        // lib.optionalAttrs cfg.preliminarySelfsigned (
+          lib.mapAttrs' (cert: conf: lib.nameValuePair "acme-selfsigned-${cert}" conf.selfsignService) certConfigs
+        );
 
       systemd.timers = lib.mapAttrs' (cert: conf: lib.nameValuePair "acme-${cert}" conf.renewTimer) certConfigs;
 
