@@ -359,13 +359,13 @@ in
         description = ''
           Forcibly import the ZFS root pool(s) during early boot.
 
-          It is highly recommended to keep this option disabled as it bypasses ZFS
-          safeguard that protect your pools.
+          It is highly recommended to keep this option disabled as it bypasses ZFS safeguards.
 
-          If NixOS fails to boot because it cannot import the root pool, you should boot
-          with the `zfs_force=1` option as a kernel parameter (e.g. by manually
-          editing the kernel params via your bootloader).
-          You should only need to do this after unclean shutdowns.
+          Instead of enabling this option, if NixOS fails to boot because a pool was "previously in use
+          from another system", you can boot once with the `zfs_force=1` kernel parameter
+          (e.g. added interactively in your bootloader menu).
+          You should only need to use `zfs_force=1` if the pool was last imported by a different host (see {option}`networking.hostId`).
+          This can happen after using the pool from a live ISO and forgetting to export it (see {manpage}`zfs-export(1)`).
         '';
       };
 
